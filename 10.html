@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>주소 파싱 + 도로명/지번 동시 조회 (GPT + JUSO) — 확장본</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Arial, sans-serif; margin: 32px; }
+    h1 { font-size: 20px; margin-bottom: 16px; }
+    .row { margin: 8px 0; }
+    input[type="text"], input[type="password"] { width: 420px; max-width: 100%; padding: 8px; }
+    button { padding: 8px 14px; cursor: pointer; }
+    .muted { color: #666; font-size: 12px; }
+    .card { border: 1px solid #ddd; padding: 12px; border-radius: 10px; margin: 10px 0; }
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    pre { background: #f8f8f8; padding: 12px; overflow: auto; border-radius: 8px; }
+    .ok { color: #0a7f2e; }
+    .warn { color: #b55a00; }
+    .err { color: #b00020; white-space: pre-wrap; }
+    label { display: inline-block; width: 140px; vertical-align: top; }
+    /* 필드 표 스타일 */
+    .kv { display: grid; grid-template-columns: 120px 1fr; gap: 6px 12px; margin-top: 10px; }
+    .kv b { color: #333; }
+    .pill { display: inline-block; background: #f1f5f9; border: 1px solid #e5e7eb; padding: 2px 6px; border-radius: 999px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>주소 파싱 + 도로명/지번 동시 조회 (ChatGPT API + 주소기반산업지원서비스) — 확장본</h1>
+
+  <!-- ⚠️ 보안 안내: 브라우저에 OpenAI API 키를 직접 넣으면 노출 위험이 있습니다.
+       실제 운영환경에선 서버(프록시)를 통해 OpenAI/JUSO 호출을 중계하세요. -->
+
+  <div class="row">
+    <label>OpenAI API Key</label>
+    <input type="password" id="openaiKey" placeholder="sk-..." />
+    <span class="muted">* 데모용. 운영에선 프록시 서버 권장</span>
+  </div>
+
+  <div class="row">
+    <label>JUSO confmKey</label>
+    <input type="text" id="jusoKey" value="U01TX0FVVEgyMDI1MTAyOTEzMDYzNzExNjM3NzM=" />
+    <span class="muted">* 주소기반산업지원서비스 승인키</span>
+  </div>
+
+  <div class="row">
+    <label>입력 주소</label>
+    <input type="text" id="raw" placeholder="예) 전주시 완산구 노송광장로 10 / 서울 강남구 삼성로 212 25동 2009호" />
+    <button id="runBtn">조회</button>
+  </div>
+
+  <div class="row muted">
+    • 흐름: (1) GPT가 주소에서 “도로명+본번” 또는 “읍면동+본번”만 추출 → (2) 그 키워드로 JUSO API 검색 → (3) 도로명/지번 동시 표시 → (4) 세부 필드 자동 채우기(통합 1회)
+  </div>
+
+  <div id="status" class="row muted"></div>
+
+  <div class="cols">
+    <div>
+      <div class="card">
+        <b>① GPT 추출 결과</b>
+        <pre id="gptOut">(아직 없음)</pre>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <b>② 검색 키워드 (JUSO에 보낼 값)</b>
+        <pre id="keywordOut">(아직 없음)</pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <b>③ 조회 결과 (도로명주소 + 지번주소 + 우편번호)</b>
+    <div id="result"></div>
+  </div>
+
+  <div class="card">
+    <b>④ 세부 필드 자동 채우기 (통합 1회 표시)</b>
+    <span class="pill">시도명 · 시군구명 · 읍면동명 · 법정리명 · 본번 · 부번 · 건물명 · 건물동명 · 건물층명 · 건물호명 · 도로명 · 건물본번 · 건물부번</span>
+    <div id="structured"></div>
+  </div>
+
+  <div class="card">
+    <b>로그 / 오류</b>
+    <div id="log" class="muted"></div>
+  </div>
+
+<script>
+/** ===============================
+ *  보조: 상태/로그 표시
+ *  =============================== */
+const el = {
+  status: document.getElementById('status'),
+  gptOut: document.getElementById('gptOut'),
+  keywordOut: document.getElementById('keywordOut'),
+  result: document.getElementById('result'),
+  structured: document.getElementById('structured'),
+  log: document.getElementById('log'),
+  openaiKey: document.getElementById('openaiKey'),
+  jusoKey: document.getElementById('jusoKey'),
+  raw: document.getElementById('raw'),
+  runBtn: document.getElementById('runBtn')
+};
+function setStatus(msg, cls='') { el.status.className = 'row ' + cls; el.status.textContent = msg; }
+function log(msg, cls='muted') { el.log.className = cls; el.log.textContent = msg; }
+
+/** ===============================
+ *  1) ChatGPT API로 핵심 요소 추출
+ *     - 도로명주소면: road + building_main_no (+ si/sigungu)
+ *     - 지번주소면:   eupmyeondong + jibun_main_no (+ si/sigungu)
+ *  =============================== */
+async function extractWithGPT(address, apiKey) {
+  const system = [
+    "너는 한국 주소 파서다.",
+    "입력 주소에서 다음 두 케이스 중 가능한 하나를 JSON으로 엄격히 반환해라:",
+    "Case A) 도로명주소 → {type:'road', si:'', sigungu:'', road:'', building_main_no:'', building_sub_no:''?}",
+    "Case B) 지번주소   → {type:'jibun', si:'', sigungu:'', eupmyeondong:'', jibun_main_no:'', jibun_sub_no:''?}",
+    "• 입력에 동/호(상세주소)가 있으면 무시해라(출력에 포함하지 말 것).",
+    "• 가능한 한 시/구 정보도 채워라(모르면 비워도 됨).",
+    "• 반드시 JSON만 출력(추가 텍스트 금지)."
+  ].join("\n");
+
+  const user = `주소: "${address}"`;
+
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ]
+    })
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error("OpenAI API 오류: " + t);
+  }
+  const data = await resp.json();
+  const content = data?.choices?.[0]?.message?.content?.trim();
+  if (!content) throw new Error("GPT 응답이 비어 있음");
+  let json;
+  try {
+    json = JSON.parse(content);
+  } catch (e) {
+    throw new Error("GPT JSON 파싱 실패: " + content);
+  }
+  return json;
+}
+
+/** ===============================
+ *  2) 주소기반산업지원서비스 JSONP 호출
+ *  =============================== */
+function callJusoJsonp({ confmKey, keyword, currentPage=1, countPerPage=10 }) {
+  return new Promise((resolve, reject) => {
+    const cbName = "jusoCb_" + Date.now() + "_" + Math.floor(Math.random()*1e6);
+    window[cbName] = (data) => {
+      try { resolve(data); }
+      finally {
+        delete window[cbName];
+        script.remove();
+      }
+    };
+    const url = "https://business.juso.go.kr/addrlink/addrLinkApiJsonp.do"
+      + `?confmKey=${encodeURIComponent(confmKey)}`
+      + `&currentPage=${encodeURIComponent(currentPage)}`
+      + `&countPerPage=${encodeURIComponent(countPerPage)}`
+      + `&keyword=${encodeURIComponent(keyword)}`
+      + `&resultType=json`
+      + `&callback=${encodeURIComponent(cbName)}`;
+
+    const script = document.createElement("script");
+    script.src = url;
+    script.onerror = () => {
+      delete window[cbName];
+      reject(new Error("JUSO JSONP 로드 실패"));
+    };
+    document.body.appendChild(script);
+  });
+}
+
+/** ===============================
+ *  3) GPT 결과로 JUSO 검색 키워드 구성
+ *  =============================== */
+function buildKeywordFromGPT(g) {
+  if (!g || !g.type) return null;
+
+  const si = (g.si || "").trim();
+  const sigungu = (g.sigungu || "").trim();
+
+  if (g.type === "road") {
+    const road = (g.road || "").trim();
+    const main = (g.building_main_no || "").trim();
+    if (!road || !main) return null;
+    const base = `${road} ${main}`;
+    const prefix = [si, sigungu].filter(Boolean).join(" ");
+    return prefix ? `${prefix} ${base}` : base;
+  } else if (g.type === "jibun") {
+    const emd = (g.eupmyeondong || "").trim();
+    const main = (g.jibun_main_no || "").trim();
+    if (!emd || !main) return null;
+    const base = `${emd} ${main}`;
+    const prefix = [si, sigungu].filter(Boolean).join(" ");
+    return prefix ? `${prefix} ${base}` : base;
+  }
+  return null;
+}
+
+/** ===============================
+ *  4) 세부 필드 추출/정규화
+ *     - JUSO 응답 → 표준화 키로 매핑
+ *     - detBdNmList에서 동/층/호 추정 파싱(있을 때만)
+ *  =============================== */
+function normalizeJusoItem(j) {
+  const base = {
+    siNm: j.siNm || "",
+    sggNm: j.sggNm || "",
+    emdNm: j.emdNm || "",
+    liNm: j.liNm || "",
+    // 지번 본/부번
+    lnbrMnnm: j.lnbrMnnm || "",
+    lnbrSlno: j.lnbrSlno || "",
+    // 도로명 + 건물 본/부번
+    rn: j.rn || "",
+    buldMnnm: j.buldMnnm || "",
+    buldSlno: j.buldSlno || "",
+    // 건물명/상세건물명
+    bdNm: j.bdNm || "",
+    detBdNmList: j.detBdNmList || ""
+  };
+
+  const detail = parseDetBdNmList(base.detBdNmList);
+  return { ...base, ...detail };
+}
+
+function parseDetBdNmList(str) {
+  // JUSO 문서상 detBdNmList는 세미콜론(;) 또는 콤마로 구분될 수 있음
+  const out = { dongNm: "", floorNm: "", hoNm: "" };
+  if (!str) return out;
+  const tokens = String(str).split(/[;,/\s]+/).filter(Boolean);
+  for (const t of tokens) {
+    if (!out.dongNm && /동$/.test(t)) out.dongNm = t;
+    else if (!out.floorNm && /층$/.test(t)) out.floorNm = t;
+    else if (!out.hoNm && /호$/.test(t)) out.hoNm = t;
+  }
+  return out;
+}
+
+function fmt(v) { return v ? String(v) : '-'; }
+
+/** ===============================
+ *  5) 결과 렌더링 (③ 다건, ④ 통합 1회)
+ *  =============================== */
+function pickMostCommonOrFirst(values) {
+  const arr = values.map(v => (v ?? "").toString().trim()).filter(Boolean);
+  if (arr.length === 0) return "";
+  const counts = new Map();
+  for (const v of arr) counts.set(v, (counts.get(v) || 0) + 1);
+  let best = arr[0], bestN = counts.get(arr[0]) || 1;
+  for (const [k,n] of counts.entries()) if (n > bestN) { best = k; bestN = n; }
+  return best;
+}
+
+function renderResults(jusoData) {
+  const common = jusoData?.results?.common;
+  const list = jusoData?.results?.juso || [];
+  if (!common || common.errorCode !== "0") {
+    el.result.innerHTML = `<div class="err">에러: ${common?.errorMessage || '알 수 없는 오류'}</div>`;
+    el.structured.innerHTML = '';
+    return;
+  }
+  if (list.length === 0) {
+    el.result.innerHTML = `<div>검색 결과가 없습니다.</div>`;
+    el.structured.innerHTML = '';
+    return;
+  }
+
+  // ③ 요약(도로명/지번) — 결과 건수만큼 그대로 나열
+  el.result.innerHTML = list.map(j => `
+    <div class="card">
+      <div><b>도로명주소:</b> ${j.roadAddr}</div>
+      <div><b>지번주소:</b> ${j.jibunAddr}</div>
+      <div><b>우편번호:</b> ${j.zipNo}</div>
+    </div>
+  `).join("");
+
+  // ④ 통합 1회 — 한 건이어도, 여러 건이어도 여기서는 "한 번만" 표시
+  const norm = list.map(normalizeJusoItem);
+  const agg = {
+    siNm:     pickMostCommonOrFirst(norm.map(s => s.siNm)),
+    sggNm:    pickMostCommonOrFirst(norm.map(s => s.sggNm)),
+    emdNm:    pickMostCommonOrFirst(norm.map(s => s.emdNm)),
+    liNm:     pickMostCommonOrFirst(norm.map(s => s.liNm)),
+    lnbrMnnm: pickMostCommonOrFirst(norm.map(s => s.lnbrMnnm)),
+    lnbrSlno: pickMostCommonOrFirst(norm.map(s => s.lnbrSlno)),
+    bdNm:     pickMostCommonOrFirst(norm.map(s => s.bdNm)),
+    dongNm:   pickMostCommonOrFirst(norm.map(s => s.dongNm)),
+    floorNm:  pickMostCommonOrFirst(norm.map(s => s.floorNm)),
+    hoNm:     pickMostCommonOrFirst(norm.map(s => s.hoNm)),
+    rn:       pickMostCommonOrFirst(norm.map(s => s.rn)),
+    buldMnnm: pickMostCommonOrFirst(norm.map(s => s.buldMnnm)),
+    buldSlno: pickMostCommonOrFirst(norm.map(s => s.buldSlno)),
+  };
+
+  el.structured.innerHTML = `
+    <div class="card">
+      <div class="kv">
+        <b>시도명</b><div>${fmt(agg.siNm)}</div>
+        <b>시군구명</b><div>${fmt(agg.sggNm)}</div>
+        <b>읍면동명</b><div>${fmt(agg.emdNm)}</div>
+        <b>법정리명</b><div>${fmt(agg.liNm)}</div>
+        <b>본번(지번)</b><div>${fmt(agg.lnbrMnnm)}</div>
+        <b>부번(지번)</b><div>${fmt(agg.lnbrSlno)}</div>
+        <b>건물명</b><div>${fmt(agg.bdNm)}</div>
+        <b>건물동명</b><div>${fmt(agg.dongNm)}</div>
+        <b>건물층명</b><div>${fmt(agg.floorNm)}</div>
+        <b>건물호명</b><div>${fmt(agg.hoNm)}</div>
+        <b>도로명</b><div>${fmt(agg.rn)}</div>
+        <b>건물본번</b><div>${fmt(agg.buldMnnm)}</div>
+        <b>건물부번</b><div>${fmt(agg.buldSlno)}</div>
+      </div>
+      <div class="muted" style="margin-top:8px;">
+        * 결과가 1건이든 N건이든, 비어있지 않은 값의 <b>최빈값</b> 기준으로 통합해 1회만 표시합니다.
+      </div>
+    </div>
+  `;
+}
+
+/** ===============================
+ *  6) 메인 플로우 (원본 동작 유지)
+ *  =============================== */
+async function run() {
+  el.result.innerHTML = "";
+  el.structured.innerHTML = "";
+  el.gptOut.textContent = "(분석 중...)";
+  el.keywordOut.textContent = "(생성 중...)";
+  log("", "muted");
+
+  const openaiKey = el.openaiKey.value.trim();
+  const jusoKey = el.jusoKey.value.trim();
+  const raw = el.raw.value.trim();
+
+  if (!openaiKey) return log("OpenAI API 키를 입력하세요.", "warn");
+  if (!jusoKey) return log("JUSO confmKey를 입력하세요.", "warn");
+  if (!raw) return log("주소를 입력하세요.", "warn");
+
+  try {
+    setStatus("① GPT로 주소 핵심요소 추출 중...", "muted");
+    const gpt = await extractWithGPT(raw, openaiKey);
+    el.gptOut.textContent = JSON.stringify(gpt, null, 2);
+
+    const keyword = buildKeywordFromGPT(gpt);
+    if (!keyword) {
+      setStatus("");
+      return log("핵심 키워드 생성 실패. 주소 형식을 확인하세요.", "err");
+    }
+    el.keywordOut.textContent = keyword;
+
+    setStatus("② JUSO API 검색 중...", "muted");
+    const juso = await callJusoJsonp({ confmKey: jusoKey, keyword, currentPage: 1, countPerPage: 10 });
+    renderResults(juso);
+
+    const total = juso?.results?.common?.totalCount ?? 0;
+    setStatus(`완료 ✅ 총 ${total}건`, "ok");
+  } catch (e) {
+    setStatus("");
+    log(String(e?.message || e), "err");
+  }
+}
+
+el.runBtn.addEventListener('click', run);
+// Enter 키 핸들러 (원본 유지)
+document.addEventListener('keypress', (e) => { if (e.key === 'Enter') run(); });
+</script>
+</body>
+</html>
